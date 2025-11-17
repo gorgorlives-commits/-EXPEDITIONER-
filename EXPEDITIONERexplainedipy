@@ -1,0 +1,944 @@
+# EXPEDITIONER (v4 - Fully Commented)
+# A complete, single-file, turn-based tactical survival roguelite
+# for the Raspberry Pi Pico and Waveshare Pico-LCD-1.8.
+#
+# This file is heavily commented for learning purposes.
+
+import framebuf
+import utime
+import random
+import micropython
+from machine import Pin, SPI, PWM
+
+# ===================================================================
+# 1. HARDWARE DEFINITIONS
+# ===================================================================
+# These are our global constants. We define all hardware pins here
+# so if we change our wiring, we only have to change them in one place.
+
+# --- PINS (Display - Waveshare Header) ---
+BL = 13
+DC = 8
+RST = 12
+MOSI = 11
+SCK = 10
+CS = 9
+# --- PINS (Buttons - Your New Layout) ---
+BTN_UP_PIN = 17
+BTN_DOWN_PIN = 18
+BTN_LEFT_PIN = 19
+BTN_RIGHT_PIN = 16
+BTN_A_PIN = 4
+BTN_B_PIN = 5
+# --- PINS (Audio - PAM8403) ---
+AUDIO_L_PIN = 0
+AUDIO_R_PIN = 1
+
+# ===================================================================
+# 2. NON-BLOCKING AUDIO LIBRARY (PicoAudio)
+# ===================================================================
+# This class is one of the most important "in-depth" parts.
+# It plays sound *without* freezing the game.
+class PicoAudio:
+    """ A non-blocking PWM sound effect player. """
+    
+    # 'l_pin_id' and 'r_pin_id' are the GPIO pin numbers (0 and 1)
+    def __init__(self, l_pin_id, r_pin_id, default_volume=20000):
+        try:
+            # PWM (Pulse Width Modulation) is how the Pico fakes
+            # an analog signal (like audio) using only a digital pin.
+            # We create one PWM object for each speaker.
+            self.pwm_l = PWM(Pin(l_pin_id))
+            self.pwm_r = PWM(Pin(r_pin_id))
+            
+            # This 'queue' will hold the *current* sound being played
+            # e.g., [(1000hz, 50ms), (800hz, 100ms)]
+            self.sfx_queue = []
+            self.sfx_step = 0 # Which step of the sound we are on
+            self.sfx_start_time = 0
+            self.sfx_current_duration = 0
+            self.is_playing = False # A simple flag to check if we are busy
+            self.default_volume = default_volume
+            
+            # This is our master library of all game sounds.
+            self.SFX_LIBRARY = self._define_sfx_library()
+            
+            # Start with the speakers silent.
+            self.stop()
+        except Exception as e:
+            # If the PWM fails (e.g., wrong pins), we disable audio
+            # but allow the game to keep running.
+            print(f"Error initializing PicoAudio: {e}. Audio disabled.")
+            self.pwm_l = None
+            self.is_playing = False
+
+    def _define_sfx_library(self):
+        # This is a dictionary of all our retro sounds.
+        # Each sound is a list of "notes":
+        # (frequency_hz, duration_ms, volume_16bit)
+        vol = self.default_volume
+        return {
+            'player_move': [ (150, 30, 10000) ],
+            'player_attack': [ (800, 50, vol), (600, 100, vol-5000) ],
+            'enemy_hit': [ (100, 80, vol+10000) ],
+            'player_hit': [ (200, 100, vol+15000), (150, 100, vol+10000) ],
+            'craft_item': [ (600, 50, vol), (800, 50, vol), (1000, 50, vol) ],
+            'plant_beacon': [ (1046, 80, vol), (1318, 120, vol+5000) ],
+            'find_resource': [ (1318, 80, vol+5000) ],
+            'enemy_alert': [ (1500, 100, vol) ],
+            'battle_win': [ (880, 50, vol), (1046, 50, vol), (1318, 100, vol) ],
+            'game_over_jingle': [ (400, 200, vol), (300, 200, vol), (200, 500, vol) ],
+            'game_win': [ (1046, 100, vol), (1318, 100, vol), (1568, 100, vol), (2093, 200, vol+5000) ],
+            'menu_move': [ (400, 20, 10000) ],
+            'menu_select': [ (600, 40, 15000) ],
+            'menu_cancel': [ (300, 40, 15000) ],
+        }
+
+    @micropython.native
+    def play(self, sfx_name):
+        """ 
+        This is the "non-blocking" part. Notice it doesn't have any
+        'sleep' calls. It just sets up the queue and returns instantly.
+        The 'update' function does all the waiting.
+        """
+        if not self.pwm_l or self.is_playing: return # Don't interrupt a sound
+        if sfx_name in self.SFX_LIBRARY:
+            self.sfx_queue = self.SFX_LIBRARY[sfx_name]
+            self.sfx_step = 0
+            self.is_playing = True
+            self._play_step() # Play the *first* note of the sound
+
+    @micropython.native
+    def _play_step(self):
+        """ Internal function to play one note from the queue. """
+        if not self.is_playing or self.sfx_step >= len(self.sfx_queue):
+            self.stop(); return
+        
+        # Get the note data
+        freq, dur, vol = self.sfx_queue[self.sfx_step]
+        
+        # Save the timers
+        self.sfx_start_time = utime.ticks_ms()
+        self.sfx_current_duration = dur
+        
+        # Set the speaker pins
+        if freq > 0:
+            self.pwm_l.freq(freq); self.pwm_r.freq(freq)
+            self.pwm_l.duty_u16(vol); self.pwm_r.duty_u16(vol)
+        else: # freq=0 means "silence"
+            self.pwm_l.duty_u16(0); self.pwm_r.duty_u16(0)
+
+    @micropython.native
+    def stop(self):
+        """ Stops all sound immediately. """
+        if self.pwm_l:
+            self.pwm_l.duty_u16(0); self.pwm_r.duty_u16(0)
+        self.sfx_queue = []; self.is_playing = False
+
+    @micropython.native
+    def update(self):
+        """ 
+        !! CRITICAL !! This is the "engine" of the audio system.
+        It must be called ONCE PER FRAME in the main game loop.
+        It checks if the current note's time is up and plays the next one.
+        """
+        if not self.is_playing: return
+        
+        # Check if enough time has passed
+        if utime.ticks_diff(utime.ticks_ms(), self.sfx_start_time) > self.sfx_current_duration:
+            self.sfx_step += 1 # Move to the next note
+            if self.sfx_step >= len(self.sfx_queue):
+                self.stop() # Sound is finished
+            else:
+                self._play_step() # Play the next note
+
+# ===================================================================
+# 3. LCD DRIVER (framebuf based)
+# ===================================================================
+# This is our custom driver for the Waveshare LCD.
+# It does NOT use any external 'st7735' libraries.
+# It uses MicroPython's built-in 'framebuf' and 'SPI'.
+class LCD_1inch8(framebuf.FrameBuffer):
+    def __init__(self):
+        self.width, self.height = 160, 128
+        self.cs = Pin(CS,Pin.OUT); self.rst = Pin(RST,Pin.OUT); self.cs(1)
+        # Init SPI (Serial Peripheral Interface) - this is the communication
+        # protocol the Pico uses to talk to the screen.
+        self.spi = SPI(1, 10_000_000, polarity=0, phase=0, sck=Pin(SCK), mosi=Pin(MOSI), miso=None)
+        self.dc = Pin(DC,Pin.OUT); self.dc(1)
+        
+        # This is the "canvas in memory." We draw all our pixels to this
+        # 'buffer' *first*.
+        self.buffer = bytearray(self.height * self.width * 2) # 160*128 pixels, 2 bytes per pixel
+        
+        # We tell framebuf to use our buffer as its canvas.
+        super().__init__(self.buffer, self.width, self.height, framebuf.RGB565)
+        
+        self.init_display() # Send the "magic commands" to wake up the screen
+        
+        # Define our color palette (RGB565 format)
+        self.BLACK=0x0000; self.WHITE=0xFFFF; self.RED=0xF800
+        self.GREEN=0x07E0; self.BLUE=0x001F; self.YELLOW=0xFFE0
+        self.CYAN=0x07FF; self.MAGENTA=0xF81F; self.GRAY=0x8410
+        self.FLOOR_COLOR = 0x2104 # Solid dark color for the floor
+
+    def write_cmd(self, cmd):
+        """ Send a command to the display (e.g., 'wake up') """
+        self.cs(1); self.dc(0); self.cs(0)
+        self.spi.write(bytearray([cmd])); self.cs(1)
+
+    def write_data(self, buf):
+        """ Send data to the display (e.g., 'the color is red') """
+        self.cs(1); self.dc(1); self.cs(0)
+        self.spi.write(bytearray([buf])); self.cs(1)
+
+    def init_display(self):
+        """ The magic startup sequence for the ST7735 chip. """
+        self.rst(1); self.rst(0); self.rst(1)
+        self.write_cmd(0x36); self.write_data(0xA0) # Orientation
+        self.write_cmd(0x3A); self.write_data(0x05) # 16-bit color
+        self.write_cmd(0x11); utime.sleep_ms(120)   # Sleep out
+        self.write_cmd(0x29)                       # Display on
+
+    @micropython.native
+    def show(self):
+        """ 
+        This is the most important display function.
+        It takes our in-memory 'buffer' and blasts it over SPI
+        to the physical screen all at once.
+        """
+        # Set the "window" of where to draw (the whole screen)
+        self.write_cmd(0x2A); self.write_data(0x00); self.write_data(0x01); self.write_data(0x00); self.write_data(0xA0)
+        self.write_cmd(0x2B); self.write_data(0x00); self.write_data(0x00); self.write_data(0x00); self.write_data(0x7F) # 128 pixels high
+        self.write_cmd(0x2C) # "Write to RAM"
+        
+        # Send the entire buffer
+        self.cs(1); self.dc(1); self.cs(0)
+        self.spi.write(self.buffer); self.cs(1)
+
+# ===================================================================
+# 4. 8x8 SPRITE ENGINE
+# ===================================================================
+# This function lets us define art as text, which is easy to read.
+# It "pre-draws" the art into tiny 8x8 canvases (FrameBuffers).
+def create_sprite(pixel_map, color_map, w=8, h=8):
+    fb = framebuf.FrameBuffer(bytearray(w * h * 2), w, h, framebuf.RGB565)
+    for y, row in enumerate(pixel_map):
+        for x, char in enumerate(row):
+            # '.' is our transparent color (0x0000 BLACK)
+            fb.pixel(x, y, color_map.get(char, 0x0000))
+    return fb
+
+# This is our color palette for all sprites.
+PALETTE = {
+    'p_skin': 0xFC0A, 'p_suit': 0x04FF, 'p_visor': 0x0B1F, # Player
+    'g_skin': 0x8225, 'g_claw': 0xFFFF, 'g_eye': 0xF800,  # Grunt
+    's_skin': 0x07E0, 's_eye': 0xF81F,                   # Spitter
+    'rock': 0x8410, 'rock_d': 0x4208,                    # Rock
+    'salvage': 0xAE00, 'salvage_l': 0xFFE0,              # Salvage
+    'beacon': 0xFFE0, 'beacon_l': 0xFFFF,               # Beacon
+    'comp': 0x001F, 'comp_l': 0x07FF,                    # Component
+    'pod': 0xCE79, 'pod_l': 0xFFFF, 'pod_v': 0xF800,     # Pod
+    'floor': 0x2104, 'white': 0xFFFF, 'black': 0x0000
+}
+
+# This is our master "Art Library." We create all the sprites when
+# the game first loads, so they are ready to be drawn instantly.
+SPRITES = {
+    'player': create_sprite([
+        "..ppp...", ".pssssp.", ".psvssp.", ".pssssp.",
+        "..s.s...", ".s...s..", ".s...s..", "........"
+    ], {'p': PALETTE['p_skin'], 's': PALETTE['p_suit'], 'v': PALETTE['p_visor']}),
+    'grunt': create_sprite([
+        "........", "...ggg..", "..gggg..", ".gggggg.",
+        ".cgeegc.", ".cggggc.", "..g..g..", "........"
+    ], {'g': PALETTE['g_skin'], 'c': PALETTE['g_claw'], 'e': PALETTE['g_eye']}),
+    'spitter': create_sprite([
+        "........", "...ss...", "..ssss..", ".s.ss.s.",
+        ".s.es.s.", "..ssss..", "...ss...", "........"
+    ], {'s': PALETTE['s_skin'], 'e': PALETTE['s_eye']}),
+    'salvage': create_sprite([
+        "........", "...ss...", "..slls..", ".sslls..",
+        "..slls..", "...ss...", "........", "........"
+    ], {'s': PALETTE['salvage'], 'l': PALETTE['salvage_l']}),
+    'component': create_sprite([
+        "........", "..ccll..", ".clclc..", ".cclcc..",
+        ".clclc..", "..ccll..", "........", "........"
+    ], {'c': PALETTE['comp'], 'l': PALETTE['comp_l']}),
+    'pod': create_sprite([
+        "...vv...", "..vplv..", ".vplllv.", ".vplllv.",
+        ".vplllv.", ".vplllv.", "..vllv..", "...vv..."
+    ], {'p': PALETTE['pod'], 'l': PALETTE['pod_l'], 'v': PALETTE['pod_v']}),
+    'beacon': create_sprite([
+        "...b....", "..blb...", ".b.b.b..", "bbbbbbbb",
+        "...b....", "...b....", "...b....", "........"
+    ], {'b': PALETTE['beacon'], 'l': PALETTE['beacon_l']}),
+    
+    # --- GRAPHICS FIX: Floor is now a solid, non-transparent tile. ---
+    # This is what erases the player's "snake trail" and "stuck text".
+    'floor': create_sprite([
+        "ffffffff", "ffffffff", "ffffffff", "ffffffff",
+        "ffffffff", "ffffffff", "ffffffff", "ffffffff"
+    ], {'f': PALETTE['floor']}),
+}
+
+# ===================================================================
+# 5. INPUT HANDLER (CRASH FIX)
+# ===================================================================
+class InputHandler:
+    """ 
+    This class solves the "button bounce" problem. It reads all
+    buttons *once* per frame, and figures out if a button was
+    *just pressed* (a "fresh press") vs. *being held down*.
+    """
+    def __init__(self):
+        # A dictionary holding our Pin objects
+        self.buttons = {
+            'up': Pin(BTN_UP_PIN, Pin.IN, Pin.PULL_UP),
+            'down': Pin(BTN_DOWN_PIN, Pin.IN, Pin.PULL_UP),
+            'left': Pin(BTN_LEFT_PIN, Pin.IN, Pin.PULL_UP),
+            'right': Pin(BTN_RIGHT_PIN, Pin.IN, Pin.PULL_UP),
+            'a': Pin(BTN_A_PIN, Pin.IN, Pin.PULL_UP),
+            'b': Pin(BTN_B_PIN, Pin.IN, Pin.PULL_UP),
+        }
+        # Store the last state (1 = up, 0 = down)
+        self.last_state = {name: 1 for name in self.buttons}
+        # Store if pressed *this frame*
+        self.pressed_this_frame = {name: False for name in self.buttons}
+
+    @micropython.native
+    def update(self):
+        """ !! CRITICAL !! Call this once per frame. """
+        for name, pin in self.buttons.items():
+            self.pressed_this_frame[name] = False # Reset flag
+            current_state = pin.value()
+            
+            # This is the "debounce" logic:
+            # We only register a press if the button IS down (0)
+            # AND it was UP (1) last frame.
+            if current_state == 0 and self.last_state[name] == 1:
+                self.pressed_this_frame[name] = True
+                
+            self.last_state[name] = current_state
+            
+    def was_pressed(self, name):
+        """ Lets the game ask "Was 'A' pressed *just now*?" """
+        return self.pressed_this_frame[name]
+
+# ===================================================================
+# 6. GAME OBJECTS (Data Blueprints)
+# ===================================================================
+# These classes are "blueprints" for storing data.
+
+class Player:
+    """ Stores all data for the player. """
+    def __init__(self, wx, wy, tx, ty):
+        self.world_x, self.world_y = wx, wy # Which screen (0-3)
+        self.x, self.y = tx, ty # Which tile (0-19 or 0-13)
+        self.max_hp, self.hp = 30, 30
+        self.max_ap, self.ap = 2, 2
+        self.atk = 3
+        self.salvage = 5
+        self.components = 0
+        self.sprite = SPRITES['player']
+
+    # These are "helper methods" to make logic cleaner
+    def take_damage(self, amt): self.hp = max(0, self.hp - amt)
+    def heal(self, amt): self.hp = min(self.max_hp, self.hp + amt)
+    def is_alive(self): return self.hp > 0
+    def use_ap(self, amt): self.ap = max(0, self.ap - amt)
+    def refresh_ap(self): self.ap = self.max_ap
+
+class Enemy:
+    """ Stores all data for a single enemy. """
+    def __init__(self, x, y, type):
+        self.x, self.y = x, y
+        self.type = type
+        self.is_alerted = False
+        if type == 'grunt':
+            self.hp, self.atk, self.move = 5, 2, 1
+            self.sprite = SPRITES['grunt']
+        else: # spitter
+            self.hp, self.atk, self.move = 3, 1, 0
+            self.range = 3
+            self.sprite = SPRITES['spitter']
+
+    def take_damage(self, amt): self.hp = max(0, self.hp - amt)
+    def is_alive(self): return self.hp > 0
+    def alert(self): self.is_alerted = True
+
+class MapItem:
+    """ Stores data for an item on the ground. """
+    def __init__(self, x, y, type):
+        self.x, self.y = x, y
+        self.type = type
+        if type == 'salvage': self.sprite = SPRITES['salvage']
+        elif type == 'component': self.sprite = SPRITES['component']
+        elif type == 'pod': self.sprite = SPRITES['pod']
+        elif type == 'beacon': self.sprite = SPRITES['beacon']
+
+# ===================================================================
+# 7. MAP & WORLD SYSTEM (LAYOUT FIX)
+# ===================================================================
+# --- LAYOUT FIX: Map grid is now 20x14 ---
+MAP_GRID_WIDTH = 20
+MAP_GRID_HEIGHT = 14
+UI_BAR_Y = MAP_GRID_HEIGHT * 8 # 14 * 8 = 112 (This is Y-pixel 112)
+
+class MapScreen:
+    """ Holds the state for one 20x14 screen. """
+    def __init__(self, wx, wy):
+        self.layout = [[0 for _ in range(MAP_GRID_WIDTH)] for _ in range(MAP_GRID_HEIGHT)]
+        self.enemies = []
+        self.items = []
+        self.generate(wx, wy)
+
+    def generate(self, wx, wy):
+        """ This is the procedural generation for one map screen. """
+        for y in range(MAP_GRID_HEIGHT):
+            for x in range(MAP_GRID_WIDTH):
+                if random.random() < 0.15: self.layout[y][x] = 1 # 1 = rock
+        # Clear edges so the player can walk between screens
+        for y in range(MAP_GRID_HEIGHT): self.layout[y][0] = 0; self.layout[y][MAP_GRID_WIDTH-1] = 0
+        for x in range(MAP_GRID_WIDTH): self.layout[0][x] = 0; self.layout[MAP_GRID_HEIGHT-1][x] = 0
+        
+        num_spawns = random.randint(3, 6)
+        for _ in range(num_spawns):
+            x, y = random.randint(1, MAP_GRID_WIDTH-2), random.randint(1, MAP_GRID_HEIGHT-2)
+            if self.layout[y][x] == 0 and not self.get_item_at(x,y):
+                if random.random() < 0.4: # 40% chance of salvage
+                    self.items.append(MapItem(x, y, 'salvage'))
+                else: # 60% chance of enemy
+                    type = 'spitter' if random.random() < 0.3 else 'grunt'
+                    self.enemies.append(Enemy(x, y, type))
+    
+    # Helper functions to find things on this screen
+    def get_enemy_at(self, x, y):
+        for e in self.enemies:
+            if e.x == x and e.y == y and e.is_alive(): return e
+        return None
+    def get_item_at(self, x, y):
+        for i in self.items:
+            if i.x == x and i.y == y: return i
+        return None
+    def all_enemies_dead(self):
+        return not any(e.is_alive() for e in self.enemies)
+
+class WorldMap:
+    """ Manages the 4x4 grid of all 16 MapScreens. """
+    def __init__(self):
+        # Create all 16 screens in memory
+        self.screens = [[MapScreen(x, y) for x in range(4)] for y in range(4)]
+        
+        # Manually place the objective items
+        self.screens[0][0].items.append(MapItem(10, 7, 'pod'))
+        self.screens[0][3].items.append(MapItem(10, 7, 'component'))
+        self.screens[3][0].items.append(MapItem(10, 7, 'component'))
+        self.screens[3][3].items.append(MapItem(10, 7, 'component'))
+
+    def get_screen(self, wx, wy): return self.screens[wy][wx]
+    def get_beacons(self, wx, wy):
+        return [i for i in self.screens[wy][wx].items if i.type == 'beacon']
+
+# ===================================================================
+# 8. MAIN GAME CLASS (The "Brain")
+# ===================================================================
+class Game:
+    """ This class holds all other objects and manages the game logic. """
+    def __init__(self):
+        # Create one instance of all our helper classes
+        self.lcd = LCD_1inch8()
+        self.audio = PicoAudio(AUDIO_L_PIN, AUDIO_R_PIN)
+        self.inputs = InputHandler()
+        
+        # Create the game world and player
+        self.world = WorldMap()
+        self.player = Player(0, 0, 10, 7) # Start at world (0,0), tile (10,7)
+        self.current_screen = self.world.get_screen(0, 0)
+        
+        # This is the "State Machine"
+        self.state = 'TITLE' # 'TITLE', 'GAME', 'GAME_OVER', 'VICTORY'
+        self.screen_state = 'BATTLE' # 'BATTLE' or 'EXPLORE'
+        self.player_turn = True
+        
+        self.visibility_map = [[False for _ in range(MAP_GRID_WIDTH)] for _ in range(MAP_GRID_HEIGHT)]
+        self.enemy_ai_index = 0
+        
+        # Menu variables
+        self.menu_open = False
+        self.menu_options = []
+        self.menu_cursor = 0
+        self.menu_type = ''
+        
+        self.message = ""
+        self.message_timer = 0
+        
+        self.craft_options = [
+            {'name': 'Beacon', 'cost': 2},
+            {'name': 'Medkit', 'cost': 3},
+            {'name': 'Stun Grenade', 'cost': 4}
+        ]
+
+    def set_message(self, text, duration=1500):
+        """ Helper to show a pop-up message. """
+        self.message = text
+        self.message_timer = utime.ticks_add(utime.ticks_ms(), duration)
+
+    # ---------------------------------------------------------------
+    # The MAIN GAME LOOP
+    # ---------------------------------------------------------------
+    def run(self):
+        """ This is the heart of the entire game. """
+        while True:
+            try:
+                # 1. UPDATE: Read inputs, update audio timers
+                self.inputs.update()
+                self.audio.update()
+                
+                # Clear any expired pop-up messages
+                if self.message and utime.ticks_diff(self.message_timer, utime.ticks_ms()) < 0:
+                    self.message = ""
+
+                # 2. LOGIC: Route to the correct "logic" function
+                # This is the "State Machine"
+                if self.state == 'TITLE': self.update_title()
+                elif self.state == 'GAME': self.update_game()
+                elif self.state == 'GAME_OVER': self.update_game_over()
+                elif self.state == 'VICTORY': self.update_victory()
+                
+                # 3. DRAW: Route to the correct "draw" function
+                if self.state == 'TITLE': self.draw_title()
+                elif self.state == 'GAME': self.draw_game()
+                elif self.state == 'GAME_OVER': self.draw_game_over()
+                elif self.state == 'VICTORY': self.draw_victory()
+                
+                # 4. SHOW: Push the in-memory buffer to the screen
+                self.lcd.show()
+                
+                # 5. DELAY: Wait a tiny bit to cap the speed
+                utime.sleep_ms(33) # ~30 FPS
+                
+            except Exception as e:
+                # Graceful crash: stop sounds and show the error
+                self.audio.stop()
+                self.lcd.fill(self.lcd.BLACK)
+                self.lcd.text("FATAL ERROR", 5, 20, self.lcd.RED)
+                err_str = str(e)
+                self.lcd.text(err_str[0:20], 5, 40, self.lcd.WHITE)
+                if len(err_str) > 20:
+                    self.lcd.text(err_str[20:40], 5, 50, self.lcd.WHITE)
+                self.lcd.show()
+                print(f"FATAL ERROR: {e}")
+                return # Stop the loop
+
+    # --- TITLE LOGIC ---
+    def update_title(self):
+        if self.inputs.was_pressed('a'):
+            self.state = 'GAME'
+            # Reset the game
+            self.player = Player(0, 0, 10, 7)
+            self.world = WorldMap()
+            self.current_screen = self.world.get_screen(0, 0)
+            self.check_screen_state() # Set initial BATTLE/EXPLORE
+            self.player_turn = True
+            self.set_message("Find 3 Components!", 2000)
+    def draw_title(self):
+        self.lcd.fill(self.lcd.BLACK)
+        self.lcd.text("EXPEDITIONER", (160 - 12*8)//2, 40, self.lcd.WHITE)
+        self.lcd.text("Press 'A' to Start", (160 - 19*8)//2, 80, self.lcd.CYAN)
+
+    # --- END-GAME LOGIC ---
+    def update_game_over(self):
+        if self.inputs.was_pressed('a'): self.state = 'TITLE'
+    def draw_game_over(self):
+        self.lcd.fill(self.lcd.RED)
+        self.lcd.text("YOU ARE LOST", (160 - 12*8)//2, 40, self.lcd.WHITE)
+        self.lcd.text("Press 'A' to Restart", (160 - 19*8)//2, 80, self.lcd.WHITE)
+    def update_victory(self):
+        if self.inputs.was_pressed('a'): self.state = 'TITLE'
+    def draw_victory(self):
+        self.lcd.fill(self.lcd.GREEN)
+        self.lcd.text("YOU ESCAPED!", (160 - 12*8)//2, 40, self.lcd.BLACK)
+        self.lcd.text("Press 'A' to Restart", (160 - 19*8)//2, 80, self.lcd.BLACK)
+
+    # --- MAIN GAME LOGIC ---
+    def update_game(self):
+        # First, check for game over
+        if not self.player.is_alive():
+            self.state = 'GAME_OVER'
+            self.audio.play('game_over_jingle')
+            return
+            
+        # Route logic to the correct turn
+        if self.player_turn:
+            self.handle_player_input()
+        elif self.screen_state == 'BATTLE': # Enemies only act in BATTLE
+            self.handle_enemy_turn()
+        else:
+            self.player_turn = True # In EXPLORE, skip enemy turn
+
+    def handle_player_input(self):
+        if self.menu_open:
+            self.handle_menu_input()
+        else:
+            self.handle_map_input()
+
+    def handle_map_input(self):
+        """ Handles D-Pad movement and 'B' for menu. """
+        dx, dy = 0, 0
+        if self.inputs.was_pressed('up'): dy = -1
+        elif self.inputs.was_pressed('down'): dy = 1
+        elif self.inputs.was_pressed('left'): dx = -1
+        elif self.inputs.was_pressed('right'): dx = 1
+        elif self.inputs.was_pressed('b'):
+            self.open_action_menu()
+            
+        if dx != 0 or dy != 0:
+            self.player_move(dx, dy) # Player action is taken
+
+    def handle_menu_input(self):
+        """ Handles all input when a menu is open. """
+        if self.inputs.was_pressed('up'):
+            self.menu_cursor = (self.menu_cursor - 1) % len(self.menu_options)
+            self.audio.play('menu_move')
+        elif self.inputs.was_pressed('down'):
+            self.menu_cursor = (self.menu_cursor + 1) % len(self.menu_options)
+            self.audio.play('menu_move')
+        elif self.inputs.was_pressed('b'):
+            self.menu_open = False
+            self.audio.play('menu_cancel')
+        elif self.inputs.was_pressed('a'):
+            self.select_menu_option()
+
+    def player_move(self, dx, dy):
+        """ The main logic for moving the player. """
+        target_x, target_y = self.player.x + dx, self.player.y + dy
+        
+        # 1. Screen Transition?
+        if target_x < 0: self.change_screen(-1, 0, MAP_GRID_WIDTH - 1, target_y); return
+        if target_x >= MAP_GRID_WIDTH: self.change_screen(1, 0, 0, target_y); return
+        if target_y < 0: self.change_screen(0, -1, target_x, MAP_GRID_HEIGHT - 1); return
+        if target_y >= MAP_GRID_HEIGHT: self.change_screen(0, 1, target_x, 0); return
+
+        # 2. Wall collision?
+        if self.current_screen.layout[target_y][target_x] == 1:
+            self.set_message("Impassable rock.")
+            self.audio.play('enemy_hit')
+            return # No AP cost, no turn end
+
+        # 3. Enemy collision? (Bump-to-attack)
+        enemy = self.current_screen.get_enemy_at(target_x, target_y)
+        if enemy:
+            if self.screen_state == 'BATTLE':
+                self.player_attack(enemy)
+                self.player.use_ap(1)
+                self.check_end_turn()
+            else: # EXPLORE mode
+                self.set_message("Cannot move: Enemy.")
+            return
+            
+        # 4. Item collision?
+        item = self.current_screen.get_item_at(target_x, target_y)
+        if item:
+            self.player_pickup_item(item)
+            
+        # 5. If nothing else, it's a valid move.
+        self.player.x, self.player.y = target_x, target_y
+        self.audio.play('player_move')
+        
+        if self.screen_state == 'BATTLE':
+            self.player.use_ap(1)
+            self.check_end_turn() # Check if AP is 0
+        
+    def player_attack(self, enemy):
+        """ Player attacks an enemy. """
+        self.set_message(f"Attacked {enemy.type} for {self.player.atk}!")
+        enemy.take_damage(self.player.atk)
+        self.audio.play('player_attack')
+        if not enemy.is_alive():
+            self.set_message(f"{enemy.type} defeated!")
+            self.audio.play('enemy_hit')
+            self.check_for_battle_end() # Did we clear the screen?
+            
+    def player_pickup_item(self, item):
+        """ Player steps on an item. """
+        if item.type == 'salvage':
+            self.player.salvage += 1
+            self.set_message(f"Found Salvage! ({self.player.salvage})")
+            self.audio.play('find_resource')
+            self.current_screen.items.remove(item)
+        elif item.type == 'component':
+            self.player.components += 1
+            self.set_message(f"Found Pod Component! ({self.player.components}/3)")
+            self.audio.play('plant_beacon')
+            self.current_screen.items.remove(item)
+        elif item.type == 'pod':
+            if self.player.components >= 3:
+                self.state = 'VICTORY'
+                self.audio.play('game_win')
+            else:
+                self.set_message(f"Pod offline. Missing {3-self.player.components} components.")
+        
+    def change_screen(self, wx_d, wy_d, new_px, new_py):
+        """ Handles moving between the 16 world screens. """
+        new_wx = self.player.world_x + wx_d
+        new_wy = self.player.world_y + wy_d
+        # Check if new screen is valid (0-3)
+        if 0 <= new_wx <= 3 and 0 <= new_wy <= 3:
+            self.player.world_x, self.player.world_y = new_wx, new_wy
+            self.player.x, self.player.y = new_px, new_py
+            self.current_screen = self.world.get_screen(new_wx, new_wy)
+            
+            self.check_screen_state() # NEW: Set BATTLE or EXPLORE
+            
+            if self.screen_state == 'BATTLE':
+                self.player.use_ap(1)
+                self.check_end_turn()
+        
+    def check_screen_state(self):
+        """ Sets screen to BATTLE or EXPLORE. """
+        if self.current_screen.all_enemies_dead():
+            self.screen_state = 'EXPLORE'
+        else:
+            self.screen_state = 'BATTLE'
+            self.set_message("HOSTILES DETECTED!")
+            self.audio.play('enemy_alert')
+
+    def check_for_battle_end(self):
+        """ Called after an enemy dies. """
+        if self.current_screen.all_enemies_dead():
+            self.screen_state = 'EXPLORE'
+            self.set_message("AREA CLEAR! EXPLORE.")
+            self.audio.play('battle_win')
+
+    def open_action_menu(self):
+        self.menu_options = ['Craft', 'Wait']
+        if self.screen_state == 'EXPLORE':
+            self.menu_options = ['Craft'] # Can't "Wait" in explore
+        self.menu_cursor = 0
+        self.menu_type = 'action'
+        self.menu_open = True
+        self.audio.play('menu_select')
+
+    def open_craft_menu(self):
+        self.menu_options = [f"{c['name']} (Cost: {c['cost']})" for c in self.craft_options]
+        self.menu_cursor = 0
+        self.menu_type = 'craft'
+        self.menu_open = True
+        self.audio.play('menu_select')
+
+    def select_menu_option(self):
+        """ Logic for when 'A' is pressed in a menu. """
+        if self.menu_type == 'action':
+            option = self.menu_options[self.menu_cursor]
+            if option == 'Craft':
+                self.open_craft_menu()
+                return # Stay in menu
+            elif option == 'Wait':
+                self.player.ap = 0
+                self.check_end_turn()
+        
+        elif self.menu_type == 'craft':
+            selected_craft = self.craft_options[self.menu_cursor]
+            if self.player.salvage >= selected_craft['cost']:
+                self.player.salvage -= selected_craft['cost']
+                
+                if selected_craft['name'] == 'Beacon':
+                    self.current_screen.items.append(MapItem(self.player.x, self.player.y, 'beacon'))
+                    self.set_message("Planted Beacon!")
+                    self.audio.play('plant_beacon')
+                elif selected_craft['name'] == 'Medkit':
+                    self.player.heal(10)
+                    self.set_message("Used Medkit! +10 HP")
+                    self.audio.play('craft_item')
+                elif selected_craft['name'] == 'Stun Grenade':
+                    stunned = 0
+                    for e in self.current_screen.enemies:
+                        if e.is_alerted and self.dist(self.player.x, self.player.y, e.x, e.y) <= 3:
+                            e.stun_timer = 2 # Stun for 1 turn
+                            stunned += 1
+                    self.set_message(f"Stunned {stunned} enemies!")
+                    self.audio.play('craft_item')
+                
+                if self.screen_state == 'BATTLE':
+                    self.player.use_ap(1)
+                    self.check_end_turn()
+            else:
+                self.set_message("Not enough Salvage!")
+                self.audio.play('menu_cancel')
+                
+        self.menu_open = False # Close menu after action
+
+    def check_end_turn(self):
+        """ If AP is 0, flip to enemy turn. """
+        if self.screen_state == 'BATTLE' and self.player.ap <= 0:
+            self.player_turn = False
+            self.enemy_ai_index = 0 # Reset AI
+            self.player.refresh_ap()
+
+    def handle_enemy_turn(self):
+        """ 
+        This is a "step-based AI". It processes ONE enemy per frame.
+        This is a *critical* technique for Pico. It prevents the
+        game from freezing for 1-2 seconds while 10 enemies
+        all calculate their moves at once.
+        """
+        if self.enemy_ai_index >= len(self.current_screen.enemies):
+            self.player_turn = True # All enemies have moved
+            return
+
+        enemy = self.current_screen.enemies[self.enemy_ai_index]
+        self.enemy_ai_index += 1 # Move to next enemy for *next* frame
+        
+        # --- AI LOGIC FOR THIS ENEMY ---
+        if not enemy.is_alive() or not enemy.is_alerted: return
+        if hasattr(enemy, 'stun_timer') and enemy.stun_timer > 0:
+            enemy.stun_timer -= 1; return # Skip turn if stunned
+
+        px, py = self.player.x, self.player.y
+        ex, ey = enemy.x, enemy.y
+        distance = self.dist(px, py, ex, ey)
+
+        # 1. Spitter AI (Ranged)
+        if enemy.type == 'spitter':
+            if distance <= enemy.range:
+                self.player.take_damage(enemy.atk)
+                self.set_message(f"Spitter hit you for {enemy.atk}!")
+                self.audio.play('player_hit')
+
+        # 2. Grunt AI (Melee)
+        elif enemy.type == 'grunt':
+            if distance <= 1:
+                # Attack
+                self.player.take_damage(enemy.atk)
+                self.set_message(f"Grunt hit you for {enemy.atk}!")
+                self.audio.play('player_hit')
+            elif distance > 1:
+                # Move
+                dx, dy = 0, 0
+                if px > ex: dx = 1
+                elif px < ex: dx = -1
+                elif py > ey: dy = 1
+                elif py < ey: dy = -1
+                target_x, target_y = ex + dx, ey + dy
+                # Check for collision
+                if self.current_screen.layout[target_y][target_x] == 0 and \
+                   self.current_screen.get_enemy_at(target_x, target_y) is None:
+                    enemy.x, enemy.y = target_x, target_y
+
+    def update_visibility_map(self):
+        """ This is the Fog of War system. """
+        # 1. Clear all light
+        for y in range(MAP_GRID_HEIGHT):
+            for x in range(MAP_GRID_WIDTH): self.visibility_map[y][x] = False
+        
+        # 2. Add player's light
+        self.add_light(self.player.x, self.player.y, 3) # 3-tile radius
+        
+        # 3. Add light for all beacons on this screen
+        for beacon in self.world.get_beacons(self.player.world_x, self.player.world_y):
+            self.add_light(beacon.x, beacon.y, 5) # 5-tile radius
+
+    def add_light(self, cx, cy, radius):
+        """ Helper to 'paint' light onto the visibility map. """
+        for y in range(max(0, cy-radius), min(MAP_GRID_HEIGHT, cy+radius+1)):
+            for x in range(max(0, cx-radius), min(MAP_GRID_WIDTH, cx+radius+1)):
+                # This is "Chebyshev distance" (a square)
+                if max(abs(x-cx), abs(y-cy)) <= radius:
+                    self.visibility_map[y][x] = True
+
+    def dist(self, x1, y1, x2, y2):
+        """ Helper to calculate distance for AI. """
+        return max(abs(x1 - x2), abs(y1 - y2))
+
+    # ---------------------------------------------------------------
+    # The MAIN DRAW FUNCTION
+    # ---------------------------------------------------------------
+    def draw_game(self):
+        """
+        This draws the entire game state. The order is very
+        important (draw from bottom-up).
+        """
+        # --- GRAPHICS FIX: Clear the *entire* buffer to BLACK. ---
+        # This prevents "stuck text" and "snake trails".
+        self.lcd.fill(self.lcd.BLACK)
+        
+        # 1. Update the Fog of War
+        self.update_visibility_map()
+        
+        # 2. Draw the visible map (Floor, Rocks, Items, Enemies)
+        for y in range(MAP_GRID_HEIGHT): # 0-13
+            for x in range(MAP_GRID_WIDTH):
+                if not self.visibility_map[y][x]:
+                    continue # Skip drawing (already black)
+                
+                # Draw the solid floor tile (this erases old stuff)
+                self.lcd.blit(SPRITES['floor'], x*8, y*8)
+                
+                # Draw Rock (as a character)
+                if self.current_screen.layout[y][x] == 1:
+                    self.lcd.text("O", x*8, y*8, self.lcd.GRAY)
+                
+                # Draw Items
+                item = self.current_screen.get_item_at(x,y)
+                if item: self.lcd.blit(item.sprite, x*8, y*8, 0x0000) # 0=transparent
+                
+                # Draw Enemies
+                enemy = self.current_screen.get_enemy_at(x,y)
+                if enemy:
+                    if not enemy.is_alerted:
+                        enemy.alert(); self.audio.play('enemy_alert')
+                    self.lcd.blit(enemy.sprite, x*8, y*8, 0x0000)
+        
+        # 3. Draw Player (on top of map)
+        self.lcd.blit(self.player.sprite, self.player.x*8, self.player.y*8, 0x0000)
+        
+        # 4. Draw UI Bar (on top of everything)
+        # --- LAYOUT FIX: UI is now drawn at Y=112 ---
+        self.lcd.fill_rect(0, UI_BAR_Y, 160, 16, self.lcd.BLACK)
+        self.lcd.text(f"HP: {self.player.hp}", 2, UI_BAR_Y + 4, self.lcd.GREEN)
+        
+        ap_color = self.lcd.CYAN if self.player.ap > 0 else self.lcd.GRAY
+        if self.screen_state == 'BATTLE':
+            self.lcd.text(f"AP: {self.player.ap}", 50, UI_BAR_Y + 4, ap_color)
+        
+        self.lcd.text(f"S: {self.player.salvage}", 88, UI_BAR_Y + 4, self.lcd.YELLOW)
+        self.lcd.text(f"C: {self.player.components}/3", 125, UI_BAR_Y + 4, self.lcd.MAGENTA)
+
+        # 5. Draw Pop-up Message (on top)
+        if self.message:
+            w = len(self.message) * 8
+            x = (160 - w) // 2
+            y_pos = (UI_BAR_Y // 2) - 6 # Center in map area
+            self.lcd.fill_rect(x-2, y_pos-2, w+4, 12, self.lcd.BLACK)
+            self.lcd.rect(x-2, y_pos-2, w+4, 12, self.lcd.WHITE)
+            self.lcd.text(self.message, x, y_pos, self.lcd.WHITE)
+            
+        # 6. Draw Menu (on top)
+        if self.menu_open:
+            w, h = 100, (len(self.menu_options) * 10) + 4
+            x, y = (160 - w) // 2, (UI_BAR_Y - h) // 2
+            self.lcd.fill_rect(x, y, w, h, self.lcd.BLACK)
+            self.lcd.rect(x, y, w, h, self.lcd.WHITE)
+            for i, option in enumerate(self.menu_options):
+                color = self.lcd.WHITE
+                if i == self.menu_cursor:
+                    color = self.lcd.YELLOW
+                    self.lcd.text(">", x + 4, y + 4 + i*10, color)
+                self.lcd.text(option, x + 14, y + 4 + i*10, color)
+
+# ===================================================================
+# 9. RUN GAME
+# ===================================================================
+if __name__ == "__main__":
+    # --- BATTERY BOOT FIX ---
+    # This delay is CRITICAL for running off battery.
+    # It gives the LCD and other hardware time to power on
+    # before our code tries to talk to it.
+    utime.sleep_ms(500)
+    
+    # This is the line that starts the entire game
+    game = Game()
+    game.run()
+
+
